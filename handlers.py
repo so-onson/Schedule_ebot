@@ -1,5 +1,10 @@
 from aiogram import Router, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import (
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery
+)
 from aiogram.filters import Command
 
 from aiogram.fsm.state import StatesGroup, State
@@ -39,35 +44,6 @@ async def cmd_start(message: Message):
         "Я помогу отслеживать твое рабочее время 👀",
         reply_markup=main_keyboard
     )
-
-@router.message(F.text == "📁 Активности")
-async def show_activities(message: Message):
-    user_id = message.from_user.id
-
-    cursor.execute("""
-        SELECT id, name FROM activities WHERE user_id=?
-    """, (user_id,))
-
-    rows = cursor.fetchall()
-
-    if not rows:
-        await message.answer("Нет активностей. Создай через /add")
-        return
-
-    # создаём кнопки
-    buttons = []
-    for act_id, name in rows:
-        buttons.append([KeyboardButton(text=f"📌 {name}")])
-
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=buttons,
-        resize_keyboard=True
-    )
-
-    await message.answer(
-    f"lol Выбрано: {name} ✅",
-    reply_markup=keyboard
-)
 
 @router.message(F.text.startswith("📌 "))
 async def select_activity_button(message: Message):
@@ -127,35 +103,6 @@ async def handle_activity_name(message: Message, state: FSMContext):
     )
 
     await state.clear()
-
-@router.message(Command("select"))
-async def select_activity(message: Message):
-    user_id = message.from_user.id
-
-    try:
-        act_id = int(message.text.split()[1])
-    except:
-        await message.answer("Используй: /select ID")
-        return
-
-    # проверяем, что такая активность есть
-    cursor.execute("""
-        SELECT id FROM activities WHERE id=? AND user_id=?
-    """, (act_id, user_id))
-
-    if not cursor.fetchone():
-        await message.answer("Нет такой активности")
-        return
-
-    # сохраняем выбор
-    cursor.execute("""
-        INSERT OR REPLACE INTO user_state (user_id, current_activity_id)
-        VALUES (?, ?)
-    """, (user_id, act_id))
-
-    conn.commit()
-
-    await message.answer("Активность выбрана ✅")
 
 # ---------- НАЧАТЬ РАБОТУ ----------
 @router.message(F.text == "▶️ Начать работу")
@@ -248,17 +195,18 @@ async def stop_work(message: Message):
 
     await message.answer(f"Отработано: {duration}")
 
-class ReportState(StatesGroup):
-    choosing_activity = State()
-    choosing_period = State()
+from datetime import timedelta
+
 
 # ---------- ОТЧЕТ ----------
 @router.message(F.text == "📊 Отчет")
-async def report_start(message: Message, state: FSMContext):
+async def report_start(message: Message):
+
     user_id = message.from_user.id
 
     cursor.execute("""
-        SELECT name FROM activities
+        SELECT id, name
+        FROM activities
         WHERE user_id=?
     """, (user_id,))
 
@@ -268,14 +216,18 @@ async def report_start(message: Message, state: FSMContext):
         await message.answer("Нет активностей")
         return
 
-    buttons = [
-        [KeyboardButton(text=f"📌 {name}")]
-        for (name,) in rows
-    ]
+    buttons = []
 
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=buttons,
-        resize_keyboard=True
+    for act_id, name in rows:
+        buttons.append([
+            InlineKeyboardButton(
+                text=name,
+                callback_data=f"report_activity_{act_id}"
+            )
+        ])
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=buttons
     )
 
     await message.answer(
@@ -283,78 +235,100 @@ async def report_start(message: Message, state: FSMContext):
         reply_markup=keyboard
     )
 
-    await state.set_state(ReportState.choosing_activity)
 
-
-@router.message(ReportState.choosing_activity)
-async def report_choose_activity(
-    message: Message,
-    state: FSMContext
+# ---------- ВЫБОР ПЕРИОДА ----------
+@router.callback_query(
+    F.data.startswith("report_activity_")
+)
+async def report_choose_period(
+    callback: CallbackQuery
 ):
-    activity_name = message.text.replace("📌 ", "")
 
-    await state.update_data(activity_name=activity_name)
-
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Сегодня")],
-            [KeyboardButton(text="7 дней")],
-            [KeyboardButton(text="30 дней")],
-            [KeyboardButton(text="Все время")]
-        ],
-        resize_keyboard=True
+    activity_id = int(
+        callback.data.replace(
+            "report_activity_",
+            ""
+        )
     )
 
-    await message.answer(
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Сегодня",
+                    callback_data=f"period_today_{activity_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="7 дней",
+                    callback_data=f"period_7_{activity_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="30 дней",
+                    callback_data=f"period_30_{activity_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Все время",
+                    callback_data=f"period_all_{activity_id}"
+                )
+            ]
+        ]
+    )
+
+    await callback.message.edit_text(
         "Выбери период:",
         reply_markup=keyboard
     )
 
-    await state.set_state(ReportState.choosing_period)
 
-
-from datetime import timedelta
-
-@router.message(ReportState.choosing_period)
+# ---------- ГЕНЕРАЦИЯ ОТЧЕТА ----------
+@router.callback_query(
+    F.data.startswith("period_")
+)
 async def report_finish(
-    message: Message,
-    state: FSMContext
+    callback: CallbackQuery
 ):
-    user_id = message.from_user.id
-    period_text = message.text
 
-    data = await state.get_data()
-    activity_name = data["activity_name"]
+    user_id = callback.from_user.id
 
-    # получаем activity_id
+    data = callback.data.split("_")
+
+    period = data[1]
+    activity_id = int(data[2])
+
+    # получаем активность
     cursor.execute("""
-        SELECT id, daily_goal
+        SELECT name, daily_goal
         FROM activities
-        WHERE user_id=? AND name=?
-    """, (user_id, activity_name))
+        WHERE id=? AND user_id=?
+    """, (activity_id, user_id))
 
     row = cursor.fetchone()
 
     if not row:
-        await message.answer("Ошибка активности")
+        await callback.message.answer("Ошибка активности")
         return
 
-    activity_id, daily_goal = row
+    activity_name, daily_goal = row
 
     # определяем период
     now = datetime.now()
 
-    if period_text == "Сегодня":
+    start_date = None
+
+    if period == "today":
         start_date = now.date()
 
-    elif period_text == "7 дней":
+    elif period == "7":
         start_date = (now - timedelta(days=7)).date()
 
-    elif period_text == "30 дней":
+    elif period == "30":
         start_date = (now - timedelta(days=30)).date()
-
-    else:
-        start_date = None
 
     # загружаем сессии
     cursor.execute("""
@@ -379,7 +353,9 @@ async def report_finish(
             if start_dt.date() < start_date:
                 continue
 
-        seconds = (end_dt - start_dt).total_seconds()
+        seconds = (
+            end_dt - start_dt
+        ).total_seconds()
 
         total_seconds += seconds
 
@@ -392,36 +368,58 @@ async def report_finish(
 
     total_hours = total_seconds / 3600
 
-    # считаем выполненные дни
+    avg = 0
+
+    if len(days_stats) > 0:
+        avg = total_hours / len(days_stats)
+
     completed_days = 0
 
     for sec in days_stats.values():
         if sec / 3600 >= daily_goal:
             completed_days += 1
 
-    avg = 0
-
-    if len(days_stats) > 0:
-        avg = total_hours / len(days_stats)
-
     text = (
-        f"📊 {activity_name}\n"
-        f"Период: {period_text}\n\n"
+        f"📊 {activity_name}\n\n"
+        f"Период: {period}\n"
         f"Всего: {total_hours:.2f} ч\n"
         f"Среднее: {avg:.2f} ч/день\n"
-        f"Дней с выполненной нормой: "
+        f"Выполнено дней:\n"
         f"{completed_days}/{len(days_stats)}"
     )
 
-    await message.answer(
-        text,
-        reply_markup=main_keyboard
-    )
-
-    await state.clear()
+    await callback.message.edit_text(text)
 # @router.message(F.text == "📁 Активности")
 # async def show_activities(message: Message):
 #     await list_activities(message)
+@router.message(F.text == "📁 Активности")
+async def show_activities(message: Message):
+    user_id = message.from_user.id
+
+    cursor.execute("""
+        SELECT id, name FROM activities WHERE user_id=?
+    """, (user_id,))
+
+    rows = cursor.fetchall()
+
+    if not rows:
+        await message.answer("Нет активностей. Создай через /add")
+        return
+
+    # создаём кнопки
+    buttons = []
+    for act_id, name in rows:
+        buttons.append([KeyboardButton(text=f"📌 {name}")])
+
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=buttons,
+        resize_keyboard=True
+    )
+
+    await message.answer(
+    f"lol Выбрано: {name} ✅",
+    reply_markup=keyboard
+)
 
 # ---------- НАСТРОЙКИ ----------
 @router.message(F.text == "⚙️ Настройки")
