@@ -1,5 +1,5 @@
 from aiogram import Router, F
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import Message, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
@@ -10,7 +10,9 @@ from aiogram.filters import Command
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 
-from datetime import datetime
+from aiogram.enums import ParseMode
+
+from datetime import datetime, timedelta
 from db import cursor, conn
 
 router = Router()
@@ -18,12 +20,13 @@ router = Router()
 # ---------- КЛАВИАТУРА ----------
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="▶️ Начать работу")],
-        [KeyboardButton(text="⏹ Закончить работу")],
-        [KeyboardButton(text="📊 Отчет")],
+        [
+            KeyboardButton(text="⚪️ Начать сессию"), 
+            KeyboardButton(text="⬛️ Закончить")
+        ],
+        [KeyboardButton(text="📄 Отчет")],
         [KeyboardButton(text="⚙️ Настройки")],
-        [KeyboardButton(text="📁 Активности")],
-        [KeyboardButton(text="Добавить активность")]
+        [KeyboardButton(text="📁 Смена активности")]
     ],
     
     resize_keyboard=True
@@ -36,52 +39,42 @@ class SetupState(StatesGroup):
 class ActivityState(StatesGroup):
     waiting_name = State()
 
+class ReminderState(StatesGroup):
+    choosing_on_off = State()
+    choosing_hours = State()
 
 # ---------- START ----------
 @router.message(Command("start"))
 async def cmd_start(message: Message):
-    await message.answer(
-        "Я помогу отслеживать твое рабочее время 👀",
-        reply_markup=main_keyboard
+    buttons = [
+        [InlineKeyboardButton(
+            text="Добавить активность",
+            callback_data="add_activity"
+        )],
+        [InlineKeyboardButton(
+            text="Выбрать активность",
+            callback_data="set_activity"
+        )]
+    ]
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=buttons
     )
 
-@router.message(F.text.startswith("📌 "))
-async def select_activity_button(message: Message):
-    user_id = message.from_user.id
-
-    # достаём название
-    name = message.text.replace("📌 ", "")
-
-    # ищем в БД
-    cursor.execute("""
-        SELECT id FROM activities
-        WHERE user_id=? AND name=?
-    """, (user_id, name))
-
-    row = cursor.fetchone()
-
-    if not row:
-        await message.answer("Ошибка выбора")
-        return
-
-    activity_id = row[0]
-
-    # сохраняем выбор
-    cursor.execute("""
-        INSERT OR REPLACE INTO user_state (user_id, current_activity_id)
-        VALUES (?, ?)
-    """, (user_id, activity_id))
-
-    conn.commit()
-
     await message.answer(
-    f"Выбрано: {name} ✅",
-    reply_markup=main_keyboard)
-
+        "Я помогу отслеживать твое рабочее время 👀\n\n"
+        "Создай новую активность или выбери из существующих",
+        reply_markup=keyboard
+    )
 
 @router.message(F.text == "Добавить активность")
 async def add_activity_start(message: Message, state: FSMContext):
-    await message.answer("Введите название новой активности:")
+    await message.answer("Введите название новой активности:", reply_markup=ReplyKeyboardRemove())
+    await state.set_state(ActivityState.waiting_name)
+
+@router.callback_query(F.data == "add_activity")
+async def add_activity_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введите название новой активности:")
     await state.set_state(ActivityState.waiting_name)
     
 
@@ -91,25 +84,44 @@ async def handle_activity_name(message: Message, state: FSMContext):
     name = message.text
 
     cursor.execute("""
-        INSERT INTO activities (user_id, name, daily_goal, reminder_hours, reminders_on)
+        INSERT INTO activity (user_id, name, daily_goal, reminder_hours, reminders_on)
         VALUES (?, ?, ?, ?, ?)
-    """, (user_id, name, 8, 6, 1))
+    """, (user_id, name, 8, 6, 0))
+
+    cursor.execute("""
+        SELECT id FROM activity
+        WHERE user_id=? AND name=?
+    """, (user_id, name))
+
+    row = cursor.fetchone()
+
+    if not row:
+        await message.answer("Ошибка создания")
+        return
+
+    activity_id = row[0]
+
+    cursor.execute("""
+        INSERT OR REPLACE INTO user_state (user_id, current_activity_id)
+        VALUES (?, ?)
+    """, (user_id, activity_id))
 
     conn.commit()
 
     await message.answer(
-        f"Создано: {name} ✅",
+        f"Создано: {name} ✔️\n\n"
+        "Количество часов по умолчанию: 8\n"
+        "Напоминания отключены\n",
         reply_markup=main_keyboard
     )
 
     await state.clear()
 
 # ---------- НАЧАТЬ РАБОТУ ----------
-@router.message(F.text == "▶️ Начать работу")
+@router.message(F.text == "⚪️ Начать сессию")
 async def start_work(message: Message):
     user_id = message.from_user.id
 
-    # 1. Получаем выбранную активность
     cursor.execute("""
         SELECT current_activity_id FROM user_state WHERE user_id=?
     """, (user_id,))
@@ -120,11 +132,27 @@ async def start_work(message: Message):
         return
 
     activity_id = row[0]
-    await message.answer(f"Активность {activity_id}")
 
-    # 2. Проверяем: нет ли уже активной сессии
     cursor.execute("""
-        SELECT id FROM work_sessions
+        SELECT name
+        FROM activity
+        WHERE id=? AND user_id=?
+    """, (activity_id, user_id))
+
+    row = cursor.fetchone()
+
+    if not row:
+        await message.answer("Ошибка активности")
+        return
+
+    activity_name = row[0]
+    await message.answer(
+        f"Активность <b>{activity_name}</b>", 
+        parse_mode=ParseMode.HTML
+    )
+
+    cursor.execute("""
+        SELECT id FROM act_session
         WHERE activity_id=? AND end_time IS NULL
     """, (activity_id,))
 
@@ -132,24 +160,23 @@ async def start_work(message: Message):
         await message.answer("Сессия уже идёт 😅")
         return
 
-    # 3. Создаём новую сессию
     now = datetime.now().isoformat()
+    date = datetime.date(datetime.now()).isoformat()
 
     cursor.execute("""
-        INSERT INTO work_sessions (activity_id, start_time)
-        VALUES (?, ?)
-    """, (activity_id, now))
+        INSERT INTO act_session (activity_id, date, start_time)
+        VALUES (?, ?, ?)
+    """, (activity_id, date, now))
 
     conn.commit()
 
     await message.answer("Старт 🚀")
 
 # ---------- ЗАКОНЧИТЬ ----------
-@router.message(F.text == "⏹ Закончить работу")
+@router.message(F.text == "⬛️ Закончить")
 async def stop_work(message: Message):
     user_id = message.from_user.id
 
-    # 1. Получаем выбранную активность
     cursor.execute("""
         SELECT current_activity_id FROM user_state WHERE user_id=?
     """, (user_id,))
@@ -161,9 +188,8 @@ async def stop_work(message: Message):
 
     activity_id = row[0]
 
-    # 2. Находим последнюю активную сессию
     cursor.execute("""
-        SELECT id, start_time FROM work_sessions
+        SELECT id, start_time FROM act_session
         WHERE activity_id=? AND end_time IS NULL
         ORDER BY id DESC LIMIT 1
     """, (activity_id,))
@@ -171,23 +197,21 @@ async def stop_work(message: Message):
     row = cursor.fetchone()
 
     if not row:
-        await message.answer("Нет активной сессии 🤷‍♀️")
+        await message.answer("Нет активной сессии ✖️")
         return
 
     session_id, start_time = row
 
-    # 3. Завершаем её
     now = datetime.now().isoformat()
 
     cursor.execute("""
-        UPDATE work_sessions
+        UPDATE act_session
         SET end_time=?
         WHERE id=?
     """, (now, session_id))
 
     conn.commit()
 
-    # 4. Считаем длительность
     duration = (
         datetime.fromisoformat(now) -
         datetime.fromisoformat(start_time)
@@ -197,16 +221,15 @@ async def stop_work(message: Message):
 
 from datetime import timedelta
 
-
 # ---------- ОТЧЕТ ----------
-@router.message(F.text == "📊 Отчет")
+@router.message(F.text == "📄 Отчет")
 async def report_start(message: Message):
 
     user_id = message.from_user.id
 
     cursor.execute("""
         SELECT id, name
-        FROM activities
+        FROM activity
         WHERE user_id=?
     """, (user_id,))
 
@@ -234,7 +257,6 @@ async def report_start(message: Message):
         "Выбери активность:",
         reply_markup=keyboard
     )
-
 
 # ---------- ВЫБОР ПЕРИОДА ----------
 @router.callback_query(
@@ -285,41 +307,38 @@ async def report_choose_period(
         reply_markup=keyboard
     )
 
-
 # ---------- ГЕНЕРАЦИЯ ОТЧЕТА ----------
-@router.callback_query(
-    F.data.startswith("period_")
-)
-async def report_finish(
-    callback: CallbackQuery
-):
+def format_seconds(seconds: float) -> str:
+    seconds = int(seconds)
 
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    sec = seconds % 60
+
+    return f"{hours}ч {minutes}м {sec}с"
+
+@router.callback_query(F.data.startswith("period_"))
+async def report_finish(callback: CallbackQuery):
     user_id = callback.from_user.id
 
-    data = callback.data.split("_")
+    _, period, activity_id = callback.data.split("_")
+    activity_id = int(activity_id)
 
-    period = data[1]
-    activity_id = int(data[2])
-
-    # получаем активность
     cursor.execute("""
         SELECT name, daily_goal
-        FROM activities
+        FROM activity
         WHERE id=? AND user_id=?
     """, (activity_id, user_id))
 
     row = cursor.fetchone()
 
     if not row:
-        await callback.message.answer("Ошибка активности")
+        await callback.message.edit_text("Ошибка активности")
         return
 
     activity_name, daily_goal = row
 
-    # определяем период
     now = datetime.now()
-
-    start_date = None
 
     if period == "today":
         start_date = now.date()
@@ -330,10 +349,12 @@ async def report_finish(
     elif period == "30":
         start_date = (now - timedelta(days=30)).date()
 
-    # загружаем сессии
+    else:
+        start_date = None  # all time
+
     cursor.execute("""
         SELECT start_time, end_time
-        FROM work_sessions
+        FROM act_session
         WHERE activity_id=?
         AND end_time IS NOT NULL
     """, (activity_id,))
@@ -344,69 +365,63 @@ async def report_finish(
     days_stats = {}
 
     for start, end in rows:
-
         start_dt = datetime.fromisoformat(start)
         end_dt = datetime.fromisoformat(end)
 
-        # фильтр периода
-        if start_date:
-            if start_dt.date() < start_date:
-                continue
+        if start_date and start_dt.date() < start_date:
+            continue
 
-        seconds = (
-            end_dt - start_dt
-        ).total_seconds()
+        seconds = (end_dt - start_dt).total_seconds()
 
         total_seconds += seconds
 
         day = str(start_dt.date())
-
-        if day not in days_stats:
-            days_stats[day] = 0
-
-        days_stats[day] += seconds
+        days_stats[day] = days_stats.get(day, 0) + seconds
 
     total_hours = total_seconds / 3600
+    avg = total_seconds / len(days_stats) if days_stats else 0
 
-    avg = 0
+    text_lines = [
+        f"<b>{activity_name}</b>",
+        f"📓 Период: {period}",
+        "",
+        "По дням:"
+    ]
 
-    if len(days_stats) > 0:
-        avg = total_hours / len(days_stats)
+    for day, sec in sorted(days_stats.items()):
+        status = "✔️" if sec / 3600 >= daily_goal else ""
 
-    completed_days = 0
+        text_lines.append(
+            f"{day} — {format_seconds(sec)} {status}"
+        )
 
-    for sec in days_stats.values():
-        if sec / 3600 >= daily_goal:
-            completed_days += 1
+    text_lines += [
+        "",
+        f"⏱ Всего: {format_seconds(total_seconds)}",
+        f"↗ Среднее: {format_seconds(avg)}",
+        f"☑ Норма: {daily_goal} ч"
+    ]
 
-    text = (
-        f"📊 {activity_name}\n\n"
-        f"Период: {period}\n"
-        f"Всего: {total_hours:.2f} ч\n"
-        f"Среднее: {avg:.2f} ч/день\n"
-        f"Выполнено дней:\n"
-        f"{completed_days}/{len(days_stats)}"
+    await callback.message.edit_text(
+        "\n".join(text_lines),
+        parse_mode=ParseMode.HTML
     )
 
-    await callback.message.edit_text(text)
-# @router.message(F.text == "📁 Активности")
-# async def show_activities(message: Message):
-#     await list_activities(message)
-@router.message(F.text == "📁 Активности")
-async def show_activities(message: Message):
-    user_id = message.from_user.id
+# ---------- СМЕНА АКТИВНОСТИ ----------  
+@router.callback_query(F.data == "set_activity")
+async def set_activity_start(callback: CallbackQuery):
+    user_id = callback.from_user.id
 
     cursor.execute("""
-        SELECT id, name FROM activities WHERE user_id=?
+        SELECT id, name FROM activity WHERE user_id=?
     """, (user_id,))
 
     rows = cursor.fetchall()
 
     if not rows:
-        await message.answer("Нет активностей. Создай через /add")
+        await callback.message.answer("Нет активностей. Необходимо добавить")
         return
 
-    # создаём кнопки
     buttons = []
     for act_id, name in rows:
         buttons.append([KeyboardButton(text=f"📌 {name}")])
@@ -416,15 +431,124 @@ async def show_activities(message: Message):
         resize_keyboard=True
     )
 
+    await callback.message.answer(
+        "Выбери активность: ",
+        reply_markup=keyboard
+    )
+
+@router.message(F.text == "📁 Смена активности")
+async def show_activities(message: Message):
+    user_id = message.from_user.id
+
+    cursor.execute("""
+        SELECT id, name FROM activity WHERE user_id=?
+    """, (user_id,))
+
+    rows = cursor.fetchall()
+
+    if not rows:
+        await message.answer("Нет активностей. Необходимо добавить")
+        return
+
+    buttons = []
+    for id, name in rows:
+        buttons.append([KeyboardButton(text=f"📌 {name}")])
+
+    buttons.append([KeyboardButton(text="Назад")])
+
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=buttons,
+        resize_keyboard=True
+    )
+
     await message.answer(
-    f"lol Выбрано: {name} ✅",
-    reply_markup=keyboard
-)
+        f"Текущая активность: <b>{name}</b>",
+        reply_markup=keyboard,
+        parse_mode=ParseMode.HTML
+    )
+
+@router.message(F.text.startswith("📌 "))
+async def select_activity_button(message: Message):
+    user_id = message.from_user.id
+
+    name = message.text.replace("📌 ", "")
+
+    cursor.execute("""
+        SELECT id FROM activity
+        WHERE user_id=? AND name=?
+    """, (user_id, name))
+
+    row = cursor.fetchone()
+
+    if not row:
+        await message.answer("Ошибка выбора")
+        return
+
+    activity_id = row[0]
+
+    cursor.execute("""
+        INSERT OR REPLACE INTO user_state (user_id, current_activity_id)
+        VALUES (?, ?)
+    """, (user_id, activity_id))
+
+    conn.commit()
+
+    await message.answer(
+        f"Выбрано: {name} ✔️",
+        reply_markup=main_keyboard
+    )
 
 # ---------- НАСТРОЙКИ ----------
 @router.message(F.text == "⚙️ Настройки")
+async def setup(message: Message):
+    user_id = message.from_user.id
+
+    buttons = [
+        [KeyboardButton(text="Изменить цель по ч/д")],
+        [KeyboardButton(text="Настроить напоминания")],
+        [KeyboardButton(text="Добавить активность")],
+        [KeyboardButton(text="Назад")]
+    ]
+
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=buttons,
+        resize_keyboard=True
+    )
+
+    cursor.execute("""
+        SELECT current_activity_id FROM user_state WHERE user_id=?
+    """, (user_id,))
+    row = cursor.fetchone()
+
+    if not row:
+        await message.answer("Сначала выбери активность через 📁 Смена активности")
+        return
+
+    activity_id = row[0]
+
+    cursor.execute("""
+        SELECT name
+        FROM activity
+        WHERE id=? AND user_id=?
+    """, (activity_id, user_id))
+
+    row = cursor.fetchone()
+
+    if not row:
+        await message.answer("Ошибка активности")
+        return
+
+    activity_name = row[0]
+
+    await message.answer(
+        f"Настройки активности: <b>{activity_name}</b>",
+        reply_markup=keyboard, 
+        parse_mode=ParseMode.HTML
+    )
+
+@router.message(F.text == "Изменить цель по ч/д")
 async def setup(message: Message, state: FSMContext):
-    await message.answer("Сколько часов в день ты планируешь работать?")
+    await message.answer("Сколько часов в день ты планируешь работать?", reply_markup=ReplyKeyboardRemove())
     await state.set_state(SetupState.waiting_hours)
 
 
@@ -435,15 +559,168 @@ async def process_hours(message: Message, state: FSMContext):
     try:
         hours = float(message.text)
     except:
-        await message.answer("Введи число (например 6 или 8)")
+        await message.answer(
+            "Введи число (например 6.5)"
+        )
         return
 
     cursor.execute("""
-        INSERT OR REPLACE INTO work_settings (user_id, hours_per_day)
-        VALUES (?, ?)
-    """, (user_id, hours))
+        SELECT current_activity_id
+        FROM user_state
+        WHERE user_id=?
+    """, (user_id,))
+
+    row = cursor.fetchone()
+
+    if not row:
+        await message.answer("Активность не выбрана")
+        return
+
+    activity_id = row[0]
+
+    cursor.execute("""
+        UPDATE activity
+        SET daily_goal=?
+        WHERE id=?
+    """, (hours, activity_id))
 
     conn.commit()
 
-    await message.answer(f"Сохранила: {hours} часов 👍")
+    await message.answer(
+        f"Цель обновлена: {hours} ч/д ✔️",
+        reply_markup=main_keyboard
+    )
+
     await state.clear()
+
+@router.message(F.text == "Настроить напоминания")
+async def setup_reminders(message: Message, state: FSMContext):
+
+    buttons = [
+        [
+            KeyboardButton(text="Включить"),
+            KeyboardButton(text="Выключить")
+        ],
+        [KeyboardButton(text="Изменить интервал")],
+        [KeyboardButton(text="Назад")]
+    ]
+
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=buttons,
+        resize_keyboard=True
+    )
+
+    await message.answer(
+        "Настрой напоминания:",
+        reply_markup=keyboard
+    )
+
+    await state.set_state(ReminderState.choosing_on_off)
+
+@router.message(ReminderState.choosing_on_off)
+async def handle_reminders_toggle(message: Message, state: FSMContext):
+
+    user_id = message.from_user.id
+    text = message.text
+
+    cursor.execute("""
+        SELECT current_activity_id
+        FROM user_state
+        WHERE user_id=?
+    """, (user_id,))
+
+    row = cursor.fetchone()
+
+    if not row:
+        await message.answer("Сначала выбери активность")
+        return
+
+    activity_id = row[0]
+
+    if text == "Включить":
+        cursor.execute("""
+            UPDATE activity
+            SET reminders_on=1
+            WHERE id=?
+        """, (activity_id,))
+
+        conn.commit()
+
+        await message.answer("Напоминания включены ✔️")
+
+    elif text == "Выключить":
+        cursor.execute("""
+            UPDATE activity
+            SET reminders_on=0
+            WHERE id=?
+        """, (activity_id,))
+
+        conn.commit()
+
+        await message.answer("Напоминания выключены ✖️")
+
+    elif text == "Изменить интервал":
+
+        await message.answer(
+            "Через сколько часов напоминать?", 
+            reply_markup=ReplyKeyboardRemove()
+        )
+        await state.set_state(ReminderState.choosing_hours)
+        return
+    
+    elif text == "Назад":
+        await state.clear()
+
+        await message.answer(
+            "...",
+            reply_markup=main_keyboard
+        )
+
+    await state.clear()
+
+@router.message(ReminderState.choosing_hours)
+async def set_reminder_hours(message: Message, state: FSMContext):
+
+    user_id = message.from_user.id
+
+    try:
+        hours = float(message.text)
+    except:
+        await message.answer(
+            "Введите число (например 6.5)",
+            reply_markup=main_keyboard
+        )
+        return
+
+    cursor.execute("""
+        SELECT current_activity_id
+        FROM user_state
+        WHERE user_id=?
+    """, (user_id,))
+
+    row = cursor.fetchone()
+
+    if not row:
+        await message.answer("Сначала выбери активность")
+        return
+
+    activity_id = row[0]
+
+    cursor.execute("""
+        UPDATE activity
+        SET reminder_hours=?
+        WHERE id=?
+    """, (hours, activity_id))
+
+    conn.commit()
+
+    await message.answer(
+        f"Интервал установлен: {hours} ч ⏰",
+        reply_markup=main_keyboard
+    )
+
+    await state.clear()
+
+@router.message(F.text == "Назад")
+async def setup(message: Message):
+    await message.answer("...", reply_markup=main_keyboard)
