@@ -1,0 +1,17 @@
+[Unit]
+Description=My Telegram Bot Service
+After=network.target
+
+[Service]
+Type=simple
+User=so-onson
+Group=so-onson
+WorkingDirectory=/home/so-onson/Schedule_ebot
+ExecStart=/home/so-onson/Schedule_ebot/shedule_bot/bin/python3 /home/so-onson/Schedule_ebot/bot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
